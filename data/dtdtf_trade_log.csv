@@ -1,1 +1,2 @@
 Symbol,EntryDate,EntryPrice,Quantity,Capital,ExitDate,ExitPrice,PnL,PnL%,DaysHeld,ExitReason,TrackType
+THERMAX,2026-06-30,5125.1,1,5125.1,2026-07-06,4607.5,-517.6,-10.1,6,Stop loss hit (4612.59),Paper
