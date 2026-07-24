@@ -1,3 +1,5 @@
 Symbol,EntryDate,EntryPrice,Quantity,Capital,ExitDate,ExitPrice,PnL,PnL%,DaysHeld,ExitReason,TrackType
 THERMAX,2026-06-30,5125.1,1,5125.1,2026-07-06,4607.5,-517.6,-10.1,6,Stop loss hit (4612.59),Paper
 TRENT,2026-07-03,3317.8,3,9953.4,2026-07-08,2927.8,-1170.0,-11.75,5,Stop loss hit (2986.02),Paper
+BDL,2026-07-03,1384.9,7,9694.3,2026-07-24,1239.8,-1015.7,-10.48,21,Stop loss hit (1246.41),Paper
+MAZDOCK,2026-07-03,2555.0,3,7665.0,2026-07-24,2298.9,-768.3,-10.02,21,Stop loss hit (2299.5),Paper
