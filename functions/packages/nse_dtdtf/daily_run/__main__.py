@@ -8,8 +8,42 @@ Uses only requests + standard library (no pip installs needed).
 
 Signal: Dual trend (15-bar daily, 12-bar weekly) confluence check across
         both timeframes. Entry when one timeframe is already green and the
-        other just turned green. Exit when daily flips red AND price closes
-        below daily lower line, or stop loss hit.
+        other just turned green.
+
+Design summary (locked, Sep 2026 rewrite — mirrors the Dual Trend rewrite):
+- Watchlist swapped to the shared screener output (structurally uptrend,
+  Nifty500, healthcare-excluded) — same source as 200emabb / bb_ema_cross /
+  Dual Trend.
+- NEW daily EMA200 freshness gate on entry: price must be above the DAILY
+  EMA200 TODAY (re-checked every run, not trusted from the screener's
+  structural pass) — same discipline as the other systems.
+- NEW stop exit: trailing stop, price <= 10% below the highest DAILY high
+  since entry (replaces the old fixed 10%-below-entry-price stop).
+- Signal exit (unchanged, DTDTF-specific): both DAILY step lines flip
+  bearish AND price closes below the daily lower line — a stricter
+  confirmation than Dual Trend's plain state-flip exit. Exit logic only
+  ever looks at the DAILY timeframe, never weekly.
+- If both the signal-reversal and trailing-stop conditions fire on the
+  same day, logged as a distinct STOP_BOTH exit reason.
+- Below-EMA200 warning: an open position whose price falls below the daily
+  EMA200 while the daily confluence is still bullish is NOT force-exited —
+  only flagged in the email.
+- Hit/miss split: PnL% > 3.0 -> hit, PnL% <= 3.0 -> miss, written to two
+  separate trade logs instead of one combined log.
+- Existing open positions carry forward into the new logic as-is — a bulk
+  reassessment on the first run under the new trailing-stop/signal rules
+  is expected and fine.
+- File naming: system code as SUFFIX everywhere —
+  watchlist_dtdtf.csv, positions_dtdtf.csv (already suffixed),
+  trade_log_hit_dtdtf.csv, trade_log_miss_dtdtf.csv. The old combined
+  dtdtf_trade_log.csv is retired (archived separately, not read by this
+  script).
+- Entry snapshot: captures EMA9/EMA30/EMA200 (the standard cross-system
+  set) plus DTDTF-specific detail — daily and weekly upper/lower line
+  values and the entry type (which timeframe was already green vs. just
+  turned green).
+- positions schema keeps its extra 6th column, EntryType, as before.
+  The trade log schema does NOT carry EntryType (unchanged split).
 """
 
 import os
@@ -17,7 +51,6 @@ import csv
 import smtplib
 import time
 import base64
-import math
 from io import StringIO
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -27,40 +60,92 @@ import requests
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-LOOKBACK_DAILY   = 15
-LOOKBACK_WEEKLY  = 12
-STOP_LOSS_PCT    = 10.0
-POSITION_SIZE    = 10000
-SLEEP            = 0.5
+SYSTEM_CODE       = "dtdtf"
+
+LOOKBACK_DAILY    = 15
+LOOKBACK_WEEKLY   = 12
+TRAIL_STOP_PCT    = 10.0
+EMA_LONG          = 200
+POSITION_SIZE     = 10000
+SLEEP             = 0.5
+HIT_THRESHOLD_PCT = 3.0   # PnL% strictly greater than this -> hit, else -> miss
+
+DAILY_PERIOD      = "1y"  # enough for the 15-bar daily step lines and EMA200
+WEEKLY_PERIOD      = "2y"  # enough for the 12-bar weekly step lines
 
 
 # ─────────────────────────────────────────────
 # YAHOO FINANCE
 # ─────────────────────────────────────────────
-def fetch_ohlc(symbol, interval='1d', period='1y'):
+def fetch_price_bars(symbol, interval='1d', period=None):
+    """
+    Fetch OHLC bars for a symbol at the given interval.
+    Returns a list of dicts: {'date', 'high', 'low', 'close'}
+    ordered oldest -> newest. Returns None on failure.
+    """
     ticker = symbol.upper().strip()
     if not ticker.startswith("^"):
         ticker = ticker + ".NS"
-    # For weekly, fetch 2 years to get enough bars
-    if interval == '1wk':
-        period = '2y'
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    params  = {'range': period, 'interval': interval, 'events': 'history'}
+
+    if period is None:
+        period = WEEKLY_PERIOD if interval == '1wk' else DAILY_PERIOD
+
+    params = {
+        'range':    period,
+        'interval': interval,
+        'events':   'history',
+    }
     headers = {'User-Agent': 'Mozilla/5.0'}
-    try:
-        r    = requests.get(url, params=params, headers=headers, timeout=15)
-        data = r.json()
-        res  = data['chart']['result'][0]
-        q    = res['indicators']['quote'][0]
-        highs  = q['high']
-        lows   = q['low']
-        closes = q['close']
-        bars = [(h, l, c) for h, l, c in zip(highs, lows, closes)
-                if h is not None and l is not None and c is not None]
-        return bars
-    except Exception as e:
-        print(f"  {ticker} [{interval}]: {e}")
+
+    for host in ['query1', 'query2']:
+        try:
+            url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{ticker}"
+            r = requests.get(url, params=params, headers=headers, timeout=15)
+            data = r.json()
+            result = data['chart']['result'][0]
+            timestamps = result['timestamp']
+            quote = result['indicators']['quote'][0]
+            highs  = quote['high']
+            lows   = quote['low']
+            closes = quote['close']
+
+            bars = []
+            for i, ts in enumerate(timestamps):
+                c = closes[i]
+                h = highs[i]
+                l = lows[i]
+                if c is None or h is None or l is None:
+                    continue
+                bars.append({
+                    'date':  datetime.utcfromtimestamp(ts).date(),
+                    'high':  h,
+                    'low':   l,
+                    'close': c,
+                })
+            if bars:
+                return bars
+        except Exception:
+            continue
+    return None
+
+
+def calc_ema(values, period):
+    """Calculate EMA over a list of closes (oldest -> newest)."""
+    if len(values) < period:
         return None
+    k = 2 / (period + 1)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1 - k)
+    return round(ema, 2)
+
+
+def high_since(bars, entry_dt):
+    """Highest daily HIGH from entry_dt (inclusive) to the most recent bar."""
+    relevant = [b['high'] for b in bars if b['date'] >= entry_dt]
+    if not relevant:
+        return bars[-1]['high'] if bars else None
+    return max(relevant)
 
 
 # ─────────────────────────────────────────────
@@ -82,16 +167,16 @@ def compute_dual_trend(bars, lookback):
       upper_line, lower_line, upper_state, lower_state,
       confluence, fresh_confluence
     """
-    highs  = [b[0] for b in bars]
-    lows   = [b[1] for b in bars]
+    highs = [b['high'] for b in bars]
+    lows  = [b['low']  for b in bars]
 
     results = []
-    us      = 0
-    ls      = 0
+    us = 0
+    ls = 0
 
     for i in range(len(bars)):
-        upper_now  = rolling_max(highs, i, lookback)
-        lower_now  = rolling_min(lows,  i, lookback)
+        upper_now = rolling_max(highs, i, lookback)
+        lower_now = rolling_min(lows,  i, lookback)
 
         if i == 0:
             upper_prev = upper_now
@@ -118,10 +203,10 @@ def compute_dual_trend(bars, lookback):
         elif lower_broke_down:
             ls = -1
 
-        confluence         = (us == 1) and (ls == 1)
-        upper_just_flipped = (us == 1) and (prev_us != 1) and upper_broke_up
-        lower_just_flipped = (ls == 1) and (prev_ls != 1) and lower_broke_up
-        fresh_confluence   = confluence and (upper_just_flipped or lower_just_flipped)
+        confluence          = (us == 1) and (ls == 1)
+        upper_just_flipped  = (us == 1) and (prev_us != 1) and upper_broke_up
+        lower_just_flipped  = (ls == 1) and (prev_ls != 1) and lower_broke_up
+        fresh_confluence    = confluence and (upper_just_flipped or lower_just_flipped)
 
         results.append({
             'upper_line':       upper_now,
@@ -136,56 +221,72 @@ def compute_dual_trend(bars, lookback):
 
 
 def get_tf_state(bars, lookback):
-    """
-    Returns the last bar's dual trend state dict, or None if insufficient data.
-    """
+    """Last bar's dual-trend state dict, or None if insufficient data."""
     if not bars or len(bars) < lookback + 2:
         return None
     results = compute_dual_trend(bars, lookback)
     return results[-1]
 
 
-# ─────────────────────────────────────────────
-# ENTRY SIGNAL
-# ─────────────────────────────────────────────
-def check_dtdtf_signal(symbol, daily_bars, weekly_bars):
-    """
-    DTDTF Entry Rules:
-      1. Weekly already green + Daily just turned green (fresh_confluence)
-      2. Daily already green + Weekly just turned green (fresh_confluence)
-
-    Returns signal dict or None.
-    """
-    d = get_tf_state(daily_bars,  LOOKBACK_DAILY)
-    w = get_tf_state(weekly_bars, LOOKBACK_WEEKLY)
-
-    if d is None or w is None:
+def get_daily_indicators(symbol):
+    """Price + EMA9/30/200 + daily dual-trend state + raw dated bars."""
+    bars = fetch_price_bars(symbol, interval='1d', period=DAILY_PERIOD)
+    if not bars or len(bars) < LOOKBACK_DAILY + 2:
         return None
 
-    weekly_green       = w['confluence']
-    daily_green        = d['confluence']
-    daily_just_green   = d['fresh_confluence']
-    weekly_just_green  = w['fresh_confluence']
+    closes = [b['close'] for b in bars]
+    price  = round(closes[-1], 2)
+    ema9   = calc_ema(closes, 9)
+    ema30  = calc_ema(closes, 30)
+    ema200 = calc_ema(closes, EMA_LONG)
+
+    d = get_tf_state(bars, LOOKBACK_DAILY)
+    if d is None:
+        return None
+
+    return {
+        'price':            price,
+        'ema9':             ema9,
+        'ema30':            ema30,
+        'ema200':           ema200,
+        'bars':             bars,
+        'upper_line':       round(d['upper_line'], 2),
+        'lower_line':       round(d['lower_line'], 2),
+        'upper_state':      d['upper_state'],
+        'lower_state':      d['lower_state'],
+        'confluence':       d['confluence'],
+        'fresh_confluence': d['fresh_confluence'],
+    }
+
+
+def check_dtdtf_entry(daily_ind, weekly_bars):
+    """
+    DTDTF entry rule (unchanged): one timeframe already green + the other
+    just turned green.
+    Returns a signal dict or None.
+    """
+    w = get_tf_state(weekly_bars, LOOKBACK_WEEKLY)
+    if w is None:
+        return None
+
+    weekly_green      = w['confluence']
+    daily_green       = daily_ind['confluence']
+    daily_just_green  = daily_ind['fresh_confluence']
+    weekly_just_green = w['fresh_confluence']
 
     entry_triggered = (
         (weekly_green and daily_just_green) or
         (daily_green  and weekly_just_green)
     )
-
     if not entry_triggered:
         return None
 
-    close      = round(daily_bars[-1][2], 2)
-    stop       = round(close * (1 - STOP_LOSS_PCT / 100), 2)
     entry_type = 'W✅D🔔' if (weekly_green and daily_just_green) else 'D✅W🔔'
 
     return {
-        'symbol':      symbol,
-        'price':       close,
-        'stop':        stop,
-        'upper_line':  round(d['upper_line'], 2),
-        'lower_line':  round(d['lower_line'], 2),
-        'entry_type':  entry_type,
+        'entry_type':        entry_type,
+        'weekly_upper_line': round(w['upper_line'], 2),
+        'weekly_lower_line': round(w['lower_line'], 2),
     }
 
 
@@ -193,9 +294,12 @@ def check_dtdtf_signal(symbol, daily_bars, weekly_bars):
 # GITHUB REST API
 # ─────────────────────────────────────────────
 def github_get(repo, path, pat):
-    url     = f"https://api.github.com/repos/{repo}/contents/{path}"
-    headers = {'Authorization': f'token {pat}',
-               'Accept': 'application/vnd.github.v3+json'}
+    """Read a file from GitHub. Returns (content, sha)."""
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        'Authorization': f'token {pat}',
+        'Accept': 'application/vnd.github.v3+json',
+    }
     r = requests.get(url, headers=headers, timeout=15)
     r.raise_for_status()
     data    = r.json()
@@ -204,9 +308,12 @@ def github_get(repo, path, pat):
 
 
 def github_put(repo, path, pat, content, sha, message):
-    url     = f"https://api.github.com/repos/{repo}/contents/{path}"
-    headers = {'Authorization': f'token {pat}',
-               'Accept': 'application/vnd.github.v3+json'}
+    """Write a file to GitHub."""
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        'Authorization': f'token {pat}',
+        'Accept': 'application/vnd.github.v3+json',
+    }
     payload = {
         'message': message,
         'content': base64.b64encode(content.encode('utf-8')).decode('utf-8'),
@@ -231,92 +338,122 @@ def to_csv(rows, fieldnames):
 
 
 # ─────────────────────────────────────────────
-# EXIT MONITOR
+# EXIT MONITOR (daily timeframe only)
 # ─────────────────────────────────────────────
-def run_exit(positions, trade_log):
+def run_exit(positions, hit_log, miss_log):
+    """
+    Check every open position for signal-reversal / trailing-stop exit.
+    Only the DAILY timeframe is checked — matches the original design.
+    Returns (exits, holds, warnings, remaining_positions, hit_log, miss_log)
+    """
     exits         = []
     holds         = []
+    warnings      = []   # below-EMA200 but still confluence-bullish — flag only
     new_positions = []
+    hit_log       = list(hit_log)
+    miss_log      = list(miss_log)
 
     for pos in positions:
         symbol      = pos['Symbol']
         entry_price = float(pos['EntryPrice'])
         quantity    = int(pos['Quantity'])
         entry_date  = datetime.strptime(pos['EntryDate'], '%Y-%m-%d')
-        days_held   = (datetime.now() - entry_date).days
         track_type  = pos.get('TrackType', 'Paper')
-        stop_price  = round(entry_price * (1 - STOP_LOSS_PCT / 100), 2)
+        capital     = round(entry_price * quantity, 2)
+        days_held   = (datetime.now() - entry_date).days
 
-        daily_bars = fetch_ohlc(symbol, interval='1d')
-        if daily_bars is None or len(daily_bars) < 2:
+        ind = get_daily_indicators(symbol)
+        if ind is None:
             new_positions.append(pos)
+            time.sleep(SLEEP)
             continue
 
-        close   = round(daily_bars[-1][2], 2)
-        pnl     = round((close - entry_price) * quantity, 2)
-        pnl_pct = round((close - entry_price) / entry_price * 100, 2)
+        price = ind['price']
 
-        d = get_tf_state(daily_bars, LOOKBACK_DAILY)
+        hi_since = high_since(ind['bars'], entry_date.date())
+        trail_stop_price = round(hi_since * (1 - TRAIL_STOP_PCT / 100), 2) if hi_since else None
+
+        # Signal exit unchanged: both daily lines bearish AND price below
+        # the daily lower line — stricter than a plain state flip.
+        signal_reversed = (ind['upper_state'] == -1 and ind['lower_state'] == -1
+                            and price < ind['lower_line'])
+        trail_stop = trail_stop_price is not None and price <= trail_stop_price
 
         exit_type   = None
         exit_reason = None
 
-        # Exit: daily both lines flipped red AND price below daily lower line
-        if d and d['upper_state'] == -1 and d['lower_state'] == -1 and close < d['lower_line']:
+        if signal_reversed and trail_stop:
+            exit_type   = 'STOP_BOTH'
+            exit_reason = (f"Daily trend flipped bearish (price below lower line) AND "
+                            f"trailing stop hit ({trail_stop_price}, high since entry {hi_since})")
+        elif signal_reversed:
             exit_type   = 'SIGNAL'
             exit_reason = 'Daily trend flipped bearish — price below lower line'
-        elif close <= stop_price:
-            exit_type   = 'STOP'
-            exit_reason = f'Stop loss hit ({stop_price})'
+        elif trail_stop:
+            exit_type   = 'STOP_TRAIL'
+            exit_reason = f"Trailing stop hit ({trail_stop_price}, high since entry {hi_since})"
 
-        result = {
-            'Symbol':     symbol,
-            'TrackType':  track_type,
-            'EntryPrice': entry_price,
-            'EntryDate':  pos['EntryDate'],
-            'Quantity':   quantity,
-            'Price':      close,
-            'PnL':        pnl,
-            'PnL%':       pnl_pct,
-            'DaysHeld':   days_held,
-            'ExitType':   exit_type,
-            'ExitReason': exit_reason,
-            'UpperLine':  round(d['upper_line'], 2) if d else 0,
-            'LowerLine':  round(d['lower_line'], 2) if d else 0,
-            'Stop':       stop_price,
-        }
+        pnl     = round((price - entry_price) * quantity, 2)
+        pnl_pct = round((price - entry_price) / entry_price * 100, 2)
 
         if exit_type:
-            exits.append(result)
-            trade_log.append({
+            record = {
                 'Symbol':     symbol,
                 'EntryDate':  pos['EntryDate'],
                 'EntryPrice': entry_price,
                 'Quantity':   quantity,
-                'Capital':    round(entry_price * quantity, 2),
+                'Capital':    capital,
                 'ExitDate':   datetime.now().strftime('%Y-%m-%d'),
-                'ExitPrice':  close,
+                'ExitPrice':  price,
                 'PnL':        pnl,
                 'PnL%':       pnl_pct,
                 'DaysHeld':   days_held,
                 'ExitReason': exit_reason,
                 'TrackType':  track_type,
-            })
+            }
+            exits.append(record)
+            if pnl_pct > HIT_THRESHOLD_PCT:
+                hit_log.append(record)
+            else:
+                miss_log.append(record)
         else:
-            holds.append(result)
             new_positions.append(pos)
+            holds.append({
+                'Symbol':     symbol,
+                'EntryPrice': entry_price,
+                'Price':      price,
+                'PnL':        pnl,
+                'PnL%':       pnl_pct,
+                'DaysHeld':   days_held,
+            })
+
+            if (ind['ema200'] is not None and price < ind['ema200']
+                    and ind['confluence']):
+                warnings.append({
+                    'Symbol':  symbol,
+                    'Price':   price,
+                    'EMA200':  ind['ema200'],
+                    'PnL%':    pnl_pct,
+                })
 
         time.sleep(SLEEP)
 
-    return exits, holds, new_positions, trade_log
+    return exits, holds, warnings, new_positions, hit_log, miss_log
 
 
 # ─────────────────────────────────────────────
 # ENTRY SCANNER
 # ─────────────────────────────────────────────
 def run_entry(watchlist, positions):
+    """
+    Watchlist is pre-vetted for STRUCTURAL uptrend shape by the separate
+    periodic screener. Daily EMA200 freshness re-checked here every run.
+    Entry signal: cross-timeframe confluence (one TF already green, the
+    other just turned green) AND price above daily EMA200 today.
+    """
     open_symbols = {p['Symbol'].strip() for p in positions}
     new_entries  = []
+    snapshots    = []
 
     total = len(watchlist)
     for idx, row in enumerate(watchlist):
@@ -326,45 +463,70 @@ def run_entry(watchlist, positions):
 
         print(f"  [{idx+1}/{total}] {symbol:<15}", end='\r')
 
-        daily_bars  = fetch_ohlc(symbol, interval='1d')
-        time.sleep(SLEEP)
-        weekly_bars = fetch_ohlc(symbol, interval='1wk')
-        time.sleep(SLEEP)
-
-        if daily_bars is None or weekly_bars is None:
+        daily_ind = get_daily_indicators(symbol)
+        if daily_ind is None:
+            time.sleep(SLEEP)
             continue
 
-        signal = check_dtdtf_signal(symbol, daily_bars, weekly_bars)
+        # Daily freshness gate: price must be above EMA200 TODAY (the
+        # screener only guarantees the structural slope shape).
+        if daily_ind['ema200'] is None or daily_ind['price'] <= daily_ind['ema200']:
+            time.sleep(SLEEP)
+            continue
+
+        weekly_bars = fetch_price_bars(symbol, interval='1wk', period=WEEKLY_PERIOD)
+        time.sleep(SLEEP)
+        if weekly_bars is None:
+            continue
+
+        signal = check_dtdtf_entry(daily_ind, weekly_bars)
         if signal:
-            quantity = max(1, int(POSITION_SIZE / signal['price']))
+            quantity   = max(1, int(POSITION_SIZE / daily_ind['price']))
+            entry_date = datetime.now().strftime('%Y-%m-%d')
+
             positions.append({
                 'Symbol':     symbol,
-                'EntryDate':  datetime.now().strftime('%Y-%m-%d'),
-                'EntryPrice': signal['price'],
+                'EntryDate':  entry_date,
+                'EntryPrice': daily_ind['price'],
                 'Quantity':   quantity,
                 'TrackType':  'Paper',
                 'EntryType':  signal['entry_type'],
             })
             open_symbols.add(symbol)
+
             new_entries.append({
-                'Symbol':    symbol,
-                'Industry':  row.get('Industry', ''),
-                'Price':     signal['price'],
-                'UpperLine': signal['upper_line'],
-                'LowerLine': signal['lower_line'],
-                'Stop':      signal['stop'],
-                'EntryType': signal['entry_type'],
+                'Symbol':          symbol,
+                'Industry':        row.get('Industry', ''),
+                'Price':           daily_ind['price'],
+                'EntryType':       signal['entry_type'],
+                'InitialStop':     round(daily_ind['price'] * (1 - TRAIL_STOP_PCT / 100), 2),
+                'DailyUpperLine':  daily_ind['upper_line'],
+                'DailyLowerLine':  daily_ind['lower_line'],
+            })
+            snapshots.append({
+                'Symbol':          symbol,
+                'EntryDate':       entry_date,
+                'Price':           daily_ind['price'],
+                'EntryType':       signal['entry_type'],
+                'DailyUpperLine':  daily_ind['upper_line'],
+                'DailyLowerLine':  daily_ind['lower_line'],
+                'WeeklyUpperLine': signal['weekly_upper_line'],
+                'WeeklyLowerLine': signal['weekly_lower_line'],
+                'EMA9':            daily_ind['ema9'],
+                'EMA30':           daily_ind['ema30'],
+                'EMA200':          daily_ind['ema200'],
             })
             print(f"  Added {symbol} ({signal['entry_type']}) "
-                  f"@ ₹{signal['price']}")
+                  f"@ Rs.{daily_ind['price']}")
 
-    return new_entries, positions
+    return new_entries, positions, snapshots
 
 
 # ─────────────────────────────────────────────
 # EMAIL
 # ─────────────────────────────────────────────
-def send_email(exits, entries, holds):
+def send_email(exits, entries, holds, warnings, alltime_pnl, alltime_count,
+               hit_count, miss_count):
     sender    = os.environ.get('GMAIL_SENDER')
     password  = os.environ.get('GMAIL_APP_PASSWORD')
     recipient = os.environ.get('GMAIL_RECIPIENT')
@@ -384,6 +546,9 @@ def send_email(exits, entries, holds):
     def section_header(title):
         return f'<h3 style="color:#1a3c5e;margin:24px 0 8px 0;">{title}</h3>'
 
+    hits   = [e for e in exits if e['PnL%'] > HIT_THRESHOLD_PCT]
+    misses = [e for e in exits if e['PnL%'] <= HIT_THRESHOLD_PCT]
+
     html = f'''
     <div style="font-family:Arial,sans-serif;max-width:750px;margin:0 auto;">
     <h2 style="background:#1a3c5e;color:#fff;padding:14px 18px;margin:0;border-radius:4px 4px 0 0;">
@@ -395,31 +560,33 @@ def send_email(exits, entries, holds):
     '''
 
     # EXITS
+    html += section_header(
+        f'✅ Exits Today ({len(exits)}) &mdash; {len(hits)} hit / {len(misses)} miss'
+    ) if exits else section_header('✅ Exits: None today')
     if exits:
-        html += section_header(f'✅ Exits Today ({len(exits)})')
         html += f'<table style="{table_style()}"><thead><tr>'
-        for col in ['', 'Symbol', 'P&L %', 'P&L ₹', 'Days', 'Reason']:
+        for col in ['', 'Symbol', 'P&L %', 'P&L Rs', 'Days', 'Reason']:
             html += f'<th style="{th_style()}">{col}</th>'
         html += '</tr></thead><tbody>'
         for r in exits:
-            icon = '🟢' if r['PnL'] >= 0 else '🔴'
+            icon = '🟢' if r['PnL%'] > HIT_THRESHOLD_PCT else '🔴'
             html += f'''<tr>
                 <td style="{td_style()}">{icon}</td>
                 <td style="{td_style()}"><b>{r['Symbol']}</b></td>
                 <td style="{td_style('right')}">{r['PnL%']:+.2f}%</td>
-                <td style="{td_style('right')}">₹{r['PnL']:+.0f}</td>
+                <td style="{td_style('right')}">Rs.{r['PnL']:+.0f}</td>
                 <td style="{td_style('right')}">{r['DaysHeld']}d</td>
                 <td style="{td_style()}">{r['ExitReason']}</td>
             </tr>'''
         html += '</tbody></table>'
-    else:
-        html += section_header('✅ Exits: None today')
 
     # ENTRIES
+    html += section_header(f'🔔 New Paper Entries ({len(entries)})') \
+        if entries else section_header('🔔 New Entries: None today')
     if entries:
-        html += section_header(f'🔔 New Paper Entries ({len(entries)})')
         html += f'<table style="{table_style()}"><thead><tr>'
-        for col in ['Symbol', 'Industry', 'Entry Type', 'Price ₹', 'Stop ₹', 'Upper Line ₹', 'Lower Line ₹']:
+        for col in ['Symbol', 'Industry', 'Entry Type', 'Price Rs', 'Initial Stop Rs',
+                    'Daily Upper Rs', 'Daily Lower Rs']:
             html += f'<th style="{th_style()}">{col}</th>'
         html += '</tr></thead><tbody>'
         for e in entries:
@@ -427,14 +594,12 @@ def send_email(exits, entries, holds):
                 <td style="{td_style()}"><b>{e['Symbol']}</b></td>
                 <td style="{td_style()}">{e['Industry']}</td>
                 <td style="{td_style()}">{e['EntryType']}</td>
-                <td style="{td_style('right')}">₹{e['Price']}</td>
-                <td style="{td_style('right')}">₹{e['Stop']}</td>
-                <td style="{td_style('right')}">₹{e['UpperLine']}</td>
-                <td style="{td_style('right')}">₹{e['LowerLine']}</td>
+                <td style="{td_style('right')}">Rs.{e['Price']}</td>
+                <td style="{td_style('right')}">Rs.{e['InitialStop']}</td>
+                <td style="{td_style('right')}">Rs.{e['DailyUpperLine']}</td>
+                <td style="{td_style('right')}">Rs.{e['DailyLowerLine']}</td>
             </tr>'''
         html += '</tbody></table>'
-    else:
-        html += section_header('🔔 New Entries: None today')
 
     # OPEN POSITIONS
     if holds:
@@ -442,10 +607,10 @@ def send_email(exits, entries, holds):
         pnl_color = '#27ae60' if total_pnl >= 0 else '#e74c3c'
         html += section_header(
             f'📋 Open Positions ({len(holds)}) &nbsp;|&nbsp; '
-            f'Total P&L: <span style="color:{pnl_color}">₹{total_pnl:+.0f}</span>'
+            f'Total P&L: <span style="color:{pnl_color}">Rs.{total_pnl:+.0f}</span>'
         )
         html += f'<table style="{table_style()}"><thead><tr>'
-        for col in ['', 'Symbol', 'Entry ₹', 'Price ₹', 'P&L %', 'P&L ₹', 'Days']:
+        for col in ['', 'Symbol', 'Entry Rs', 'Price Rs', 'P&L %', 'P&L Rs', 'Days']:
             html += f'<th style="{th_style()}">{col}</th>'
         html += '</tr></thead><tbody>'
         for r in holds:
@@ -453,21 +618,58 @@ def send_email(exits, entries, holds):
             html += f'''<tr>
                 <td style="{td_style()}">{icon}</td>
                 <td style="{td_style()}"><b>{r['Symbol']}</b></td>
-                <td style="{td_style('right')}">₹{r['EntryPrice']:.2f}</td>
-                <td style="{td_style('right')}">₹{r['Price']:.2f}</td>
+                <td style="{td_style('right')}">Rs.{r['EntryPrice']:.2f}</td>
+                <td style="{td_style('right')}">Rs.{r['Price']:.2f}</td>
                 <td style="{td_style('right')}">{r['PnL%']:+.2f}%</td>
-                <td style="{td_style('right')}">₹{r['PnL']:+.0f}</td>
+                <td style="{td_style('right')}">Rs.{r['PnL']:+.0f}</td>
                 <td style="{td_style('right')}">{r['DaysHeld']}d</td>
             </tr>'''
         html += '</tbody></table>'
     else:
         html += section_header('📋 Open Positions: None')
 
+    # BELOW-EMA200 WARNING (open positions only)
+    if warnings:
+        html += section_header(f'⚠️ Below EMA200, Still Confluence-Bullish ({len(warnings)})')
+        html += f'<table style="{table_style()}"><thead><tr>'
+        for col in ['Symbol', 'Price Rs', 'EMA200 Rs', 'P&L %']:
+            html += f'<th style="{th_style()}">{col}</th>'
+        html += '</tr></thead><tbody>'
+        for w in warnings:
+            html += f'''<tr>
+                <td style="{td_style()}"><b>{w['Symbol']}</b></td>
+                <td style="{td_style('right')}">Rs.{w['Price']:.2f}</td>
+                <td style="{td_style('right')}">Rs.{w['EMA200']:.2f}</td>
+                <td style="{td_style('right')}">{w['PnL%']:+.2f}%</td>
+            </tr>'''
+        html += '</tbody></table>'
+
+    # CUMULATIVE TRADE LOG P&L
+    at_color = '#27ae60' if alltime_pnl >= 0 else '#e74c3c'
+    hit_rate = f'{(hit_count / alltime_count * 100):.0f}%' if alltime_count else 'N/A'
+    html += section_header('📈 All-Time Trade Log')
+    html += f'''
+    <table style="{table_style()}"><tbody>
+        <tr>
+            <td style="{td_style()}">Closed trades</td>
+            <td style="{td_style('right')}">{alltime_count} ({hit_count} hit / {miss_count} miss, {hit_rate} hit rate)</td>
+        </tr>
+        <tr>
+            <td style="{td_style()}">Cumulative P&amp;L</td>
+            <td style="{td_style('right')}"><span style="color:{at_color}"><b>Rs.{alltime_pnl:+,.0f}</b></span></td>
+        </tr>
+    </tbody></table>
+    '''
+
     # FOOTER
     html += f'''
     <p style="margin-top:24px;font-size:12px;color:#888;">
-        <a href="https://github.com/{repo_name}/blob/main/data/dtdtf_trade_log.csv"
-           style="color:#1a3c5e;">View trade log on GitHub</a><br>
+        <a href="https://github.com/{repo_name}/blob/master/data/trade_log_hit_{SYSTEM_CODE}.csv" style="color:#1a3c5e;">
+            View hit log
+        </a> &nbsp;|&nbsp;
+        <a href="https://github.com/{repo_name}/blob/master/data/trade_log_miss_{SYSTEM_CODE}.csv" style="color:#1a3c5e;">
+            View miss log
+        </a><br>
         — NSE DTDTF Trader (automated)
     </p>
     </div>
@@ -496,39 +698,64 @@ def main(args):
     pat       = os.environ.get('GITHUB_PAT')
     repo_name = os.environ.get('GITHUB_REPO')
 
+    pos_path      = f'data/positions_{SYSTEM_CODE}.csv'
+    hit_log_path  = f'data/trade_log_hit_{SYSTEM_CODE}.csv'
+    miss_log_path = f'data/trade_log_miss_{SYSTEM_CODE}.csv'
+    wl_path       = f'data/watchlist_{SYSTEM_CODE}.csv'
+    snap_path     = f'data/entry_snapshot_{SYSTEM_CODE}.csv'
+
     try:
         print("\n[1/5] Loading data from GitHub...")
-        pos_content, pos_sha = github_get(repo_name, 'data/positions_dtdtf.csv',    pat)
-        log_content, log_sha = github_get(repo_name, 'data/dtdtf_trade_log.csv',    pat)
-        wl_content,  _       = github_get(repo_name, 'data/watchlist.csv',          pat)
-        positions  = parse_csv(pos_content)
-        trade_log  = parse_csv(log_content)
-        watchlist  = parse_csv(wl_content)
+        pos_content, pos_sha       = github_get(repo_name, pos_path, pat)
+        hitlog_content, hit_sha    = github_get(repo_name, hit_log_path, pat)
+        misslog_content, miss_sha  = github_get(repo_name, miss_log_path, pat)
+        wl_content, _              = github_get(repo_name, wl_path, pat)
+        snap_content, snap_sha     = github_get(repo_name, snap_path, pat)
+
+        positions       = parse_csv(pos_content)
+        hit_log         = parse_csv(hitlog_content)
+        miss_log        = parse_csv(misslog_content)
+        watchlist       = parse_csv(wl_content)
+        entry_snapshots = parse_csv(snap_content)
         print(f"      {len(positions)} open positions | {len(watchlist)} watchlist stocks")
 
         print("\n[2/5] Exit Monitor...")
-        exits, holds, positions, trade_log = run_exit(positions, trade_log)
-        print(f"      {len(exits)} exit(s) | {len(holds)} holding")
+        exits, holds, warnings, positions, hit_log, miss_log = run_exit(positions, hit_log, miss_log)
+        print(f"      {len(exits)} exit(s) | {len(holds)} holding | {len(warnings)} below-EMA200 warning(s)")
 
         print("\n[3/5] Entry Scanner...")
-        entries, positions = run_entry(watchlist, positions)
+        entries, positions, new_snapshots = run_entry(watchlist, positions)
+        entry_snapshots.extend(new_snapshots)
         print(f"      {len(entries)} new signal(s)")
 
         print("\n[4/5] Syncing to GitHub...")
         commit_msg = f"Auto-update — {datetime.now().strftime('%Y-%m-%d')}"
 
-        pos_fields = ['Symbol', 'EntryDate', 'EntryPrice', 'Quantity', 'TrackType', 'EntryType']
-        log_fields = ['Symbol', 'EntryDate', 'EntryPrice', 'Quantity', 'Capital',
-                      'ExitDate', 'ExitPrice', 'PnL', 'PnL%', 'DaysHeld',
-                      'ExitReason', 'TrackType']
+        pos_fields  = ['Symbol', 'EntryDate', 'EntryPrice', 'Quantity', 'TrackType', 'EntryType']
+        log_fields  = ['Symbol', 'EntryDate', 'EntryPrice', 'Quantity', 'Capital',
+                       'ExitDate', 'ExitPrice', 'PnL', 'PnL%', 'DaysHeld',
+                       'ExitReason', 'TrackType']
+        snap_fields = ['Symbol', 'EntryDate', 'Price', 'EntryType',
+                       'DailyUpperLine', 'DailyLowerLine',
+                       'WeeklyUpperLine', 'WeeklyLowerLine',
+                       'EMA9', 'EMA30', 'EMA200']
 
-        github_put(repo_name, 'data/positions_dtdtf.csv', pat,
+        github_put(repo_name, pos_path, pat,
                    to_csv(positions, pos_fields), pos_sha, commit_msg)
-        github_put(repo_name, 'data/dtdtf_trade_log.csv', pat,
-                   to_csv(trade_log, log_fields), log_sha, commit_msg)
+        github_put(repo_name, hit_log_path, pat,
+                   to_csv(hit_log, log_fields), hit_sha, commit_msg)
+        github_put(repo_name, miss_log_path, pat,
+                   to_csv(miss_log, log_fields), miss_sha, commit_msg)
+        github_put(repo_name, snap_path, pat,
+                   to_csv(entry_snapshots, snap_fields), snap_sha, commit_msg)
+
+        alltime_pnl = (sum(float(r['PnL']) for r in hit_log) +
+                       sum(float(r['PnL']) for r in miss_log))
+        alltime_count = len(hit_log) + len(miss_log)
 
         print("\n[5/5] Sending email...")
-        send_email(exits, entries, holds)
+        send_email(exits, entries, holds, warnings, alltime_pnl, alltime_count,
+                   len(hit_log), len(miss_log))
 
         print("\n" + "="*55)
         print("  Done.")
