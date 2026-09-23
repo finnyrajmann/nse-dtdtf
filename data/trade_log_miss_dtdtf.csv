@@ -1,12 +1,1 @@
 Symbol,EntryDate,EntryPrice,Quantity,Capital,ExitDate,ExitPrice,PnL,PnL%,DaysHeld,ExitReason,TrackType
-OFSS,2026-07-03,10986.0,1,10986.0,2026-09-23,10989.0,3.0,0.03,82,"Trailing stop hit (11286.0, high since entry 12540.0)",Paper
-SHRIRAMFIN,2026-07-03,1066.7,9,9600.3,2026-09-23,1006.0,-546.3,-5.69,82,"Trailing stop hit (1038.33, high since entry 1153.699951171875)",Paper
-BAJAJFINSV,2026-07-03,1855.7,5,9278.5,2026-09-23,1823.4,-161.5,-1.74,82,"Trailing stop hit (1906.65, high since entry 2118.5)",Paper
-360ONE,2026-07-03,1070.0,9,9630.0,2026-09-23,1072.7,24.3,0.25,82,"Trailing stop hit (1100.61, high since entry 1222.9000244140625)",Paper
-GODREJIND,2026-07-03,1211.8,8,9694.4,2026-09-23,1099.6,-897.6,-9.26,82,"Trailing stop hit (1298.7, high since entry 1443.0)",Paper
-HEXT,2026-07-13,550.25,18,9904.5,2026-09-23,504.2,-828.9,-8.37,72,"Trailing stop hit (560.52, high since entry 622.7999877929688)",Paper
-EXIDEIND,2026-07-16,419.2,23,9641.6,2026-09-23,429.7,241.5,2.5,69,"Trailing stop hit (446.76, high since entry 496.3999938964844)",Paper
-MPHASIS,2026-07-24,2273.8,4,9095.2,2026-09-23,2265.0,-35.2,-0.39,61,"Trailing stop hit (2301.21, high since entry 2556.89990234375)",Paper
-M&M,2026-07-31,3221.8,3,9665.4,2026-09-23,3044.5,-531.9,-5.5,54,"Trailing stop hit (3181.14, high since entry 3534.60009765625)",Paper
-APOLLOTYRE,2026-08-17,444.1,22,9770.2,2026-09-23,402.55,-914.1,-9.36,37,"Trailing stop hit (420.66, high since entry 467.3999938964844)",Paper
-ASHOKLEY,2026-08-25,173.29,57,9877.53,2026-09-23,160.75,-714.78,-7.24,29,"Trailing stop hit (163.66, high since entry 181.83999633789062)",Paper

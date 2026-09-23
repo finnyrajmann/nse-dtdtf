@@ -1,5 +1,1 @@
 Symbol,EntryDate,EntryPrice,Quantity,Capital,ExitDate,ExitPrice,PnL,PnL%,DaysHeld,ExitReason,TrackType
-ENDURANCE,2026-06-30,2663.2,3,7989.6,2026-09-23,2756.4,279.6,3.5,85,"Trailing stop hit (2764.8, high since entry 3072.0)",Paper
-COFORGE,2026-07-03,1441.9,6,8651.4,2026-09-23,1803.0,2166.6,25.04,82,"Trailing stop hit (1819.08, high since entry 2021.199951171875)",Paper
-LODHA,2026-07-03,1006.2,9,9055.8,2026-09-23,1144.0,1240.2,13.7,82,"Trailing stop hit (1210.45, high since entry 1344.949951171875)",Paper
-SOLARINDS,2026-07-09,17971.0,1,17971.0,2026-09-23,19890.0,1919.0,10.68,76,"Trailing stop hit (20430.0, high since entry 22700.0)",Paper
