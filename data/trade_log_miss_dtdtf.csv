@@ -1,1 +1,2 @@
 Symbol,EntryDate,EntryPrice,Quantity,Capital,ExitDate,ExitPrice,PnL,PnL%,DaysHeld,ExitReason,TrackType
+TATAINVEST,2026-07-03,667.55,14,9345.7,2026-09-24,674.3,94.5,1.01,83,"Trailing stop hit (675.45, high since entry 750.5)",Paper
