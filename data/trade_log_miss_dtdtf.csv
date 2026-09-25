@@ -1,9 +1,1 @@
 Symbol,EntryDate,EntryPrice,Quantity,Capital,ExitDate,ExitPrice,PnL,PnL%,DaysHeld,ExitReason,TrackType
-TATAINVEST,2026-07-03,667.55,14,9345.7,2026-09-24,674.3,94.5,1.01,83,"Trailing stop hit (675.45, high since entry 750.5)",Paper
-EICHERMOT,2026-06-26,7598.0,1,7598.0,2026-09-25,7338.5,-259.5,-3.42,91,"Trailing stop hit (7348.5, high since entry 8165.0)",Paper
-LTF,2026-07-03,315.25,31,9772.75,2026-09-25,282.0,-1030.75,-10.55,84,"Trailing stop hit (304.74, high since entry 338.6000061035156)",Paper
-NAUKRI,2026-08-11,1282.0,7,8974.0,2026-09-25,1224.0,-406.0,-4.52,45,"Trailing stop hit (1251.9, high since entry 1391.0)",Paper
-CHOLAFIN,2026-08-17,1894.4,5,9472.0,2026-09-25,1681.7,-1063.5,-11.23,39,"Trailing stop hit (1732.5, high since entry 1925.0)",Paper
-TATACAP,2026-08-18,359.25,27,9699.75,2026-09-25,336.25,-621.0,-6.4,38,"Trailing stop hit (340.2, high since entry 378.0)",Paper
-POLICYBZR,2026-08-25,1795.2,5,8976.0,2026-09-25,1207.2,-2940.0,-32.75,31,"Trailing stop hit (1714.41, high since entry 1904.9000244140625)",Paper
-IDEA,2026-08-31,14.68,681,9997.08,2026-09-25,14.12,-381.36,-3.81,25,"Trailing stop hit (14.21, high since entry 15.789999961853027)",Paper
